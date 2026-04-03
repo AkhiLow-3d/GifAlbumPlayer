@@ -2,8 +2,8 @@ import sys
 from pathlib import Path
 
 from PIL import Image, ImageSequence
-from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
-from PySide6.QtGui import QAction, QImage, QPixmap
+from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal, QSettings
+from PySide6.QtGui import QAction, QImage, QKeySequence, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -62,6 +62,8 @@ class GifAlbumPlayer(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
 
+        self.settings = QSettings("akhiLow", "GifAlbumPlayer")
+
         self.setWindowTitle("GIF Album Player")
         self.resize(700, 900)
 
@@ -79,12 +81,16 @@ class GifAlbumPlayer(QMainWindow):
         self.preload_job_id: int = 0
         self.thread_pool = QThreadPool.globalInstance()
 
+        self.is_paused: bool = False
+        self.is_fullscreen: bool = False
+
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
         self.timer.timeout.connect(self._advance_frame)
 
         self._build_ui()
-        self._build_menu()
+        self._build_actions()
+        self._restore_settings()
 
     # ---------------- UI ----------------
 
@@ -101,6 +107,9 @@ class GifAlbumPlayer(QMainWindow):
 
         self.open_button = QPushButton("フォルダを開く")
         self.open_button.clicked.connect(self.choose_folder)
+        self.open_button.setAutoDefault(False)
+        self.open_button.setDefault(False)
+        self.open_button.setFocusPolicy(Qt.NoFocus)
         controls.addWidget(self.open_button)
 
         controls.addWidget(QLabel("最低再生時間(秒)"))
@@ -109,6 +118,7 @@ class GifAlbumPlayer(QMainWindow):
         self.time_spin.setMinimum(3)
         self.time_spin.setMaximum(999)
         self.time_spin.setValue(3)
+        self.time_spin.setFocusPolicy(Qt.ClickFocus)
         self.time_spin.valueChanged.connect(self._on_time_changed)
         controls.addWidget(self.time_spin)
 
@@ -128,16 +138,71 @@ class GifAlbumPlayer(QMainWindow):
         )
         self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.image_label.setMinimumSize(200, 200)
+        self.image_label.setFocusPolicy(Qt.StrongFocus)
         root.addWidget(self.image_label, 1)
+
+        self.help_label = QLabel("Space: 一時停止  ←/→: 前後移動  F: 全画面")
+        root.addWidget(self.help_label)
 
         self.status_label = QLabel("待機中")
         root.addWidget(self.status_label)
 
-    def _build_menu(self) -> None:
-        open_action = QAction("フォルダを開く", self)
-        open_action.triggered.connect(self.choose_folder)
-        open_action.setShortcut("Ctrl+O")
-        self.addAction(open_action)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.centralWidget().setFocusPolicy(Qt.StrongFocus)
+        self.image_label.setFocus()
+
+    def _build_actions(self) -> None:
+        self.open_action = QAction("フォルダを開く", self)
+        self.open_action.triggered.connect(self.choose_folder)
+        self.open_action.setShortcut("Ctrl+O")
+        self.open_action.setShortcutContext(Qt.WindowShortcut)
+        self.addAction(self.open_action)
+
+        self.pause_action = QAction("一時停止/再生", self)
+        self.pause_action.triggered.connect(self.toggle_pause)
+        self.pause_action.setShortcut(QKeySequence(Qt.Key_Space))
+        self.pause_action.setShortcutContext(Qt.WindowShortcut)
+        self.addAction(self.pause_action)
+
+        self.next_action = QAction("次へ", self)
+        self.next_action.triggered.connect(self.play_next)
+        self.next_action.setShortcut(QKeySequence(Qt.Key_Right))
+        self.next_action.setShortcutContext(Qt.WindowShortcut)
+        self.addAction(self.next_action)
+
+        self.prev_action = QAction("前へ", self)
+        self.prev_action.triggered.connect(self.play_previous)
+        self.prev_action.setShortcut(QKeySequence(Qt.Key_Left))
+        self.prev_action.setShortcutContext(Qt.WindowShortcut)
+        self.addAction(self.prev_action)
+
+        self.fullscreen_action = QAction("全画面", self)
+        self.fullscreen_action.triggered.connect(self.toggle_fullscreen)
+        self.fullscreen_action.setShortcut(QKeySequence(Qt.Key_F))
+        self.fullscreen_action.setShortcutContext(Qt.WindowShortcut)
+        self.addAction(self.fullscreen_action)
+
+    # ---------------- 設定保存 ----------------
+
+    def _restore_settings(self) -> None:
+        saved_seconds = self.settings.value("min_seconds", 3, type=int)
+        if saved_seconds < 3:
+            saved_seconds = 3
+        self.time_spin.setValue(saved_seconds)
+
+        saved_folder = self.settings.value("last_folder", "", type=str)
+        if saved_folder:
+            folder_path = Path(saved_folder)
+            if folder_path.exists() and folder_path.is_dir():
+                self.load_folder(folder_path)
+                self.status_label.setText(f"前回フォルダを復元: {folder_path}")
+
+    def _save_settings(self) -> None:
+        self.settings.setValue("min_seconds", self.time_spin.value())
+
+        if self.gif_files and 0 <= self.current_index < len(self.gif_files):
+            current_folder = str(self.gif_files[self.current_index].parent)
+            self.settings.setValue("last_folder", current_folder)
 
     # ---------------- フォルダ ----------------
 
@@ -146,6 +211,7 @@ class GifAlbumPlayer(QMainWindow):
         if not folder:
             return
         self.load_folder(Path(folder))
+        self.image_label.setFocus()
 
     def load_folder(self, folder: Path) -> None:
         gif_files = sorted(
@@ -164,6 +230,7 @@ class GifAlbumPlayer(QMainWindow):
             self.status_label.setText("GIFが見つかりません")
             return
 
+        self.settings.setValue("last_folder", str(folder))
         self.status_label.setText(f"読み込み完了: {folder}")
         self.play_index(0)
 
@@ -177,6 +244,7 @@ class GifAlbumPlayer(QMainWindow):
         self.stop_playback(clear_image=False)
         self.current_index = actual_index
         gif_path = self.gif_files[self.current_index]
+        self.is_paused = False
 
         self.file_label.setText(f"再生中: {gif_path.name}")
         self.status_label.setText(
@@ -213,12 +281,47 @@ class GifAlbumPlayer(QMainWindow):
         self.preloaded_durations = []
 
         self._start_preload_for_next()
+        self._save_settings()
+        self.image_label.setFocus()
 
     def play_next(self) -> None:
         if not self.gif_files:
             return
         next_index = (self.current_index + 1) % len(self.gif_files)
         self.play_index(next_index)
+
+    def play_previous(self) -> None:
+        if not self.gif_files:
+            return
+        prev_index = (self.current_index - 1) % len(self.gif_files)
+        self.play_index(prev_index)
+
+    def toggle_pause(self) -> None:
+        if not self.images:
+            return
+
+        if self.is_paused:
+            self.is_paused = False
+            self.status_label.setText(
+                f"{self.current_index + 1} / {len(self.gif_files)} を再生中"
+            )
+            self._schedule_next_frame()
+        else:
+            self.is_paused = True
+            self.timer.stop()
+            self.status_label.setText("一時停止")
+
+        self.image_label.setFocus()
+
+    def toggle_fullscreen(self) -> None:
+        if self.is_fullscreen:
+            self.showNormal()
+            self.is_fullscreen = False
+        else:
+            self.showFullScreen()
+            self.is_fullscreen = True
+
+        self.image_label.setFocus()
 
     def stop_playback(self, clear_image: bool = True) -> None:
         self.timer.stop()
@@ -315,13 +418,13 @@ class GifAlbumPlayer(QMainWindow):
         self.image_label.setPixmap(QPixmap.fromImage(fitted))
 
     def _schedule_next_frame(self) -> None:
-        if not self.durations:
+        if not self.durations or self.is_paused:
             return
         duration = self.durations[self.current_frame_index]
         self.timer.start(duration)
 
     def _advance_frame(self) -> None:
-        if not self.images:
+        if self.is_paused or not self.images:
             return
 
         self.elapsed_time_ms += self.durations[self.current_frame_index]
@@ -343,12 +446,19 @@ class GifAlbumPlayer(QMainWindow):
 
     def _on_time_changed(self) -> None:
         self.elapsed_time_ms = 0
+        self.settings.setValue("min_seconds", self.time_spin.value())
+        self.image_label.setFocus()
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self._show_current_frame()
 
+    def mousePressEvent(self, event) -> None:
+        super().mousePressEvent(event)
+        self.image_label.setFocus()
+
     def closeEvent(self, event) -> None:
+        self._save_settings()
         self.stop_playback()
         self._reset_preload_cache()
         self.thread_pool.waitForDone()
