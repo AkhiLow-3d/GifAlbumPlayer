@@ -2,7 +2,7 @@ import sys
 from pathlib import Path
 
 from PIL import Image, ImageSequence
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QObject, QRunnable, Qt, QThreadPool, QTimer, Signal
 from PySide6.QtGui import QAction, QImage, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -12,10 +12,50 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QSizePolicy,
+    QSpinBox,
     QVBoxLayout,
     QWidget,
-    QSpinBox,
 )
+
+
+class PreloadSignals(QObject):
+    finished = Signal(int, int, object, object, str)
+
+
+class GifPreloadTask(QRunnable):
+    def __init__(self, job_id: int, index: int, gif_path: Path) -> None:
+        super().__init__()
+        self.job_id = job_id
+        self.index = index
+        self.gif_path = gif_path
+        self.signals = PreloadSignals()
+
+    def run(self) -> None:
+        images: list[QImage] = []
+        durations: list[int] = []
+
+        try:
+            with Image.open(self.gif_path) as img:
+                for frame in ImageSequence.Iterator(img):
+                    frame_rgba = frame.convert("RGBA")
+                    data = frame_rgba.tobytes("raw", "RGBA")
+                    qimage = QImage(
+                        data,
+                        frame_rgba.width,
+                        frame_rgba.height,
+                        frame_rgba.width * 4,
+                        QImage.Format_RGBA8888,
+                    ).copy()
+                    images.append(qimage)
+
+                    duration = frame.info.get("duration", 100)
+                    if not isinstance(duration, int) or duration <= 0:
+                        duration = 100
+                    durations.append(duration)
+
+            self.signals.finished.emit(self.job_id, self.index, images, durations, "")
+        except Exception as e:
+            self.signals.finished.emit(self.job_id, self.index, [], [], str(e))
 
 
 class GifAlbumPlayer(QMainWindow):
@@ -28,11 +68,16 @@ class GifAlbumPlayer(QMainWindow):
         self.gif_files: list[Path] = []
         self.current_index: int = -1
 
-        self.frames: list[QPixmap] = []
+        self.images: list[QImage] = []
         self.durations: list[int] = []
         self.current_frame_index: int = 0
+        self.elapsed_time_ms: int = 0
 
-        self.elapsed_time_ms: int = 0  # ← 追加（経過時間）
+        self.preloaded_index: int | None = None
+        self.preloaded_images: list[QImage] = []
+        self.preloaded_durations: list[int] = []
+        self.preload_job_id: int = 0
+        self.thread_pool = QThreadPool.globalInstance()
 
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
@@ -58,7 +103,6 @@ class GifAlbumPlayer(QMainWindow):
         self.open_button.clicked.connect(self.choose_folder)
         controls.addWidget(self.open_button)
 
-        # 最低再生時間
         controls.addWidget(QLabel("最低再生時間(秒)"))
 
         self.time_spin = QSpinBox()
@@ -109,6 +153,7 @@ class GifAlbumPlayer(QMainWindow):
         )
 
         self.stop_playback()
+        self._reset_preload_cache()
         self.gif_files = gif_files
         self.current_index = -1
         self.count_label.setText(f"GIF数: {len(self.gif_files)}")
@@ -128,9 +173,9 @@ class GifAlbumPlayer(QMainWindow):
         if not self.gif_files:
             return
 
-        self.stop_playback()
-
-        self.current_index = index % len(self.gif_files)
+        actual_index = index % len(self.gif_files)
+        self.stop_playback(clear_image=False)
+        self.current_index = actual_index
         gif_path = self.gif_files[self.current_index]
 
         self.file_label.setText(f"再生中: {gif_path.name}")
@@ -138,16 +183,36 @@ class GifAlbumPlayer(QMainWindow):
             f"{self.current_index + 1} / {len(self.gif_files)} を再生中"
         )
 
-        success = self._load_gif_frames(gif_path)
-        if not success:
-            self.status_label.setText(f"壊れているGIFをスキップ: {gif_path.name}")
-            self.play_next()
-            return
+        loaded_from_preload = False
+
+        if self.preloaded_index == self.current_index and self.preloaded_images:
+            self.images = self.preloaded_images
+            self.durations = self.preloaded_durations
+            loaded_from_preload = True
+        else:
+            success, images, durations = self._load_gif_images_sync(gif_path)
+            if not success:
+                self.status_label.setText(f"壊れているGIFをスキップ: {gif_path.name}")
+                self.play_next()
+                return
+            self.images = images
+            self.durations = durations
 
         self.current_frame_index = 0
-        self.elapsed_time_ms = 0  # ← リセット
+        self.elapsed_time_ms = 0
         self._show_current_frame()
         self._schedule_next_frame()
+
+        if loaded_from_preload:
+            self.status_label.setText(
+                f"{self.current_index + 1} / {len(self.gif_files)} を再生中（先読み済み）"
+            )
+
+        self.preloaded_index = None
+        self.preloaded_images = []
+        self.preloaded_durations = []
+
+        self._start_preload_for_next()
 
     def play_next(self) -> None:
         if not self.gif_files:
@@ -155,82 +220,120 @@ class GifAlbumPlayer(QMainWindow):
         next_index = (self.current_index + 1) % len(self.gif_files)
         self.play_index(next_index)
 
-    def stop_playback(self) -> None:
+    def stop_playback(self, clear_image: bool = True) -> None:
         self.timer.stop()
-        self.frames = []
+        self.images = []
         self.durations = []
         self.current_frame_index = 0
         self.elapsed_time_ms = 0
-        self.image_label.clear()
+        if clear_image:
+            self.image_label.clear()
 
-    # ---------------- GIF読み込み ----------------
+    # ---------------- 読み込み ----------------
 
-    def _load_gif_frames(self, gif_path: Path) -> bool:
-        self.frames = []
-        self.durations = []
+    def _load_gif_images_sync(
+        self, gif_path: Path
+    ) -> tuple[bool, list[QImage], list[int]]:
+        images: list[QImage] = []
+        durations: list[int] = []
 
         try:
             with Image.open(gif_path) as img:
                 for frame in ImageSequence.Iterator(img):
                     frame_rgba = frame.convert("RGBA")
-                    pixmap = self._pil_to_pixmap(frame_rgba)
-                    self.frames.append(pixmap)
+                    data = frame_rgba.tobytes("raw", "RGBA")
+                    qimage = QImage(
+                        data,
+                        frame_rgba.width,
+                        frame_rgba.height,
+                        frame_rgba.width * 4,
+                        QImage.Format_RGBA8888,
+                    ).copy()
+                    images.append(qimage)
 
                     duration = frame.info.get("duration", 100)
                     if not isinstance(duration, int) or duration <= 0:
                         duration = 100
-                    self.durations.append(duration)
+                    durations.append(duration)
 
-            return len(self.frames) > 0
-
+            return len(images) > 0, images, durations
         except Exception:
-            return False
+            return False, [], []
 
-    def _pil_to_pixmap(self, image):
-        data = image.tobytes("raw", "RGBA")
-        qimage = QImage(
-            data,
-            image.width,
-            image.height,
-            image.width * 4,
-            QImage.Format_RGBA8888,
-        )
-        return QPixmap.fromImage(qimage.copy())
+    def _start_preload_for_next(self) -> None:
+        if not self.gif_files:
+            return
+
+        next_index = (self.current_index + 1) % len(self.gif_files)
+
+        if self.preloaded_index == next_index and self.preloaded_images:
+            return
+
+        self.preload_job_id += 1
+        job_id = self.preload_job_id
+
+        task = GifPreloadTask(job_id, next_index, self.gif_files[next_index])
+        task.signals.finished.connect(self._on_preload_finished)
+        self.thread_pool.start(task)
+
+    def _on_preload_finished(
+        self,
+        job_id: int,
+        index: int,
+        images: list[QImage],
+        durations: list[int],
+        error_message: str,
+    ) -> None:
+        if job_id != self.preload_job_id:
+            return
+
+        if error_message or not images:
+            return
+
+        self.preloaded_index = index
+        self.preloaded_images = images
+        self.preloaded_durations = durations
+
+    def _reset_preload_cache(self) -> None:
+        self.preload_job_id += 1
+        self.preloaded_index = None
+        self.preloaded_images = []
+        self.preloaded_durations = []
 
     # ---------------- 表示 ----------------
 
     def _show_current_frame(self) -> None:
-        if not self.frames:
+        if not self.images:
             return
 
-        original = self.frames[self.current_frame_index]
+        original = self.images[self.current_frame_index]
         fitted = original.scaled(
             self.image_label.size(),
             Qt.KeepAspectRatio,
             Qt.SmoothTransformation,
         )
-        self.image_label.setPixmap(fitted)
+        self.image_label.setPixmap(QPixmap.fromImage(fitted))
 
     def _schedule_next_frame(self) -> None:
+        if not self.durations:
+            return
         duration = self.durations[self.current_frame_index]
         self.timer.start(duration)
 
     def _advance_frame(self) -> None:
-        if not self.frames:
+        if not self.images:
             return
 
         self.elapsed_time_ms += self.durations[self.current_frame_index]
         self.current_frame_index += 1
 
-        # 最後のフレーム
-        if self.current_frame_index >= len(self.frames):
+        if self.current_frame_index >= len(self.images):
             min_time_ms = self.time_spin.value() * 1000
 
             if self.elapsed_time_ms >= min_time_ms:
                 self.play_next()
                 return
             else:
-                # ループ
                 self.current_frame_index = 0
 
         self._show_current_frame()
@@ -238,8 +341,7 @@ class GifAlbumPlayer(QMainWindow):
 
     # ---------------- UIイベント ----------------
 
-    def _on_time_changed(self):
-        # タイマーリセット（要求仕様）
+    def _on_time_changed(self) -> None:
         self.elapsed_time_ms = 0
 
     def resizeEvent(self, event) -> None:
@@ -248,10 +350,12 @@ class GifAlbumPlayer(QMainWindow):
 
     def closeEvent(self, event) -> None:
         self.stop_playback()
+        self._reset_preload_cache()
+        self.thread_pool.waitForDone()
         super().closeEvent(event)
 
 
-def main():
+def main() -> None:
     app = QApplication(sys.argv)
     window = GifAlbumPlayer()
     window.show()
