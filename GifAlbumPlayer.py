@@ -87,6 +87,7 @@ class GifAlbumPlayer(QMainWindow):
 
         self.is_paused: bool = False
         self.is_fullscreen: bool = False
+        self.is_sidebar_visible: bool = False
 
         self.timer = QTimer(self)
         self.timer.setSingleShot(True)
@@ -95,6 +96,7 @@ class GifAlbumPlayer(QMainWindow):
         self._build_ui()
         self._build_actions()
         self._restore_settings()
+        self._apply_sidebar_visibility()
 
     # ---------------- UI ----------------
 
@@ -106,9 +108,13 @@ class GifAlbumPlayer(QMainWindow):
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(12)
 
-        left_panel = QVBoxLayout()
+        self.sidebar_widget = QWidget()
+        self.sidebar_widget.setMinimumWidth(260)
+        self.sidebar_widget.setMaximumWidth(320)
+        left_panel = QVBoxLayout(self.sidebar_widget)
+        left_panel.setContentsMargins(0, 0, 0, 0)
         left_panel.setSpacing(10)
-        root.addLayout(left_panel, 0)
+        root.addWidget(self.sidebar_widget, 0)
 
         folder_buttons = QHBoxLayout()
         left_panel.addLayout(folder_buttons)
@@ -143,6 +149,13 @@ class GifAlbumPlayer(QMainWindow):
         controls = QHBoxLayout()
         right_panel.addLayout(controls)
 
+        self.toggle_sidebar_button = QPushButton("フォルダ一覧を開く")
+        self.toggle_sidebar_button.clicked.connect(self.toggle_sidebar)
+        self.toggle_sidebar_button.setAutoDefault(False)
+        self.toggle_sidebar_button.setDefault(False)
+        self.toggle_sidebar_button.setFocusPolicy(Qt.NoFocus)
+        controls.addWidget(self.toggle_sidebar_button)
+
         controls.addWidget(QLabel("最低再生時間(秒)"))
 
         self.time_spin = QSpinBox()
@@ -176,7 +189,7 @@ class GifAlbumPlayer(QMainWindow):
         self.image_label.setFocusPolicy(Qt.StrongFocus)
         right_panel.addWidget(self.image_label, 1)
 
-        self.help_label = QLabel("Space: 一時停止  ←/→: 前後移動  F: 全画面")
+        self.help_label = QLabel("Space: 一時停止  ←/→: 前後移動  F: 全画面  Tab: フォルダ一覧開閉")
         right_panel.addWidget(self.help_label)
 
         self.status_label = QLabel("待機中")
@@ -217,6 +230,25 @@ class GifAlbumPlayer(QMainWindow):
         self.fullscreen_action.setShortcutContext(Qt.WindowShortcut)
         self.addAction(self.fullscreen_action)
 
+        self.toggle_sidebar_action = QAction("フォルダ一覧開閉", self)
+        self.toggle_sidebar_action.triggered.connect(self.toggle_sidebar)
+        self.toggle_sidebar_action.setShortcut(QKeySequence(Qt.Key_Tab))
+        self.toggle_sidebar_action.setShortcutContext(Qt.WindowShortcut)
+        self.addAction(self.toggle_sidebar_action)
+
+    def _apply_sidebar_visibility(self) -> None:
+        self.sidebar_widget.setVisible(self.is_sidebar_visible)
+        if self.is_sidebar_visible:
+            self.toggle_sidebar_button.setText("フォルダ一覧を閉じる")
+        else:
+            self.toggle_sidebar_button.setText("フォルダ一覧を開く")
+        self.image_label.setFocus()
+
+    def toggle_sidebar(self) -> None:
+        self.is_sidebar_visible = not self.is_sidebar_visible
+        self._apply_sidebar_visibility()
+        self.settings.setValue("sidebar_visible", self.is_sidebar_visible)
+
     # ---------------- 設定保存 ----------------
 
     def _restore_settings(self) -> None:
@@ -224,6 +256,8 @@ class GifAlbumPlayer(QMainWindow):
         if saved_seconds < 3:
             saved_seconds = 3
         self.time_spin.setValue(saved_seconds)
+
+        self.is_sidebar_visible = self.settings.value("sidebar_visible", False, type=bool)
 
         saved_folders_raw = self.settings.value("folder_paths", "[]", type=str)
         try:
@@ -247,6 +281,7 @@ class GifAlbumPlayer(QMainWindow):
 
     def _save_settings(self) -> None:
         self.settings.setValue("min_seconds", self.time_spin.value())
+        self.settings.setValue("sidebar_visible", self.is_sidebar_visible)
         folder_strings = [str(path) for path in self.folder_paths]
         self.settings.setValue("folder_paths", json.dumps(folder_strings, ensure_ascii=False))
 
