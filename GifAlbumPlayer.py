@@ -1,3 +1,4 @@
+import json
 import sys
 from pathlib import Path
 
@@ -9,6 +10,8 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QPushButton,
     QSizePolicy,
@@ -23,10 +26,10 @@ class PreloadSignals(QObject):
 
 
 class GifPreloadTask(QRunnable):
-    def __init__(self, job_id: int, index: int, gif_path: Path) -> None:
+    def __init__(self, job_id: int, playlist_index: int, gif_path: Path) -> None:
         super().__init__()
         self.job_id = job_id
-        self.index = index
+        self.playlist_index = playlist_index
         self.gif_path = gif_path
         self.signals = PreloadSignals()
 
@@ -53,9 +56,9 @@ class GifPreloadTask(QRunnable):
                         duration = 100
                     durations.append(duration)
 
-            self.signals.finished.emit(self.job_id, self.index, images, durations, "")
+            self.signals.finished.emit(self.job_id, self.playlist_index, images, durations, "")
         except Exception as e:
-            self.signals.finished.emit(self.job_id, self.index, [], [], str(e))
+            self.signals.finished.emit(self.job_id, self.playlist_index, [], [], str(e))
 
 
 class GifAlbumPlayer(QMainWindow):
@@ -65,9 +68,10 @@ class GifAlbumPlayer(QMainWindow):
         self.settings = QSettings("akhiLow", "GifAlbumPlayer")
 
         self.setWindowTitle("GIF Album Player")
-        self.resize(700, 900)
+        self.resize(900, 900)
 
-        self.gif_files: list[Path] = []
+        self.folder_paths: list[Path] = []
+        self.playlist: list[dict[str, Path]] = []
         self.current_index: int = -1
 
         self.images: list[QImage] = []
@@ -98,19 +102,46 @@ class GifAlbumPlayer(QMainWindow):
         central = QWidget(self)
         self.setCentralWidget(central)
 
-        root = QVBoxLayout(central)
+        root = QHBoxLayout(central)
         root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(10)
+        root.setSpacing(12)
+
+        left_panel = QVBoxLayout()
+        left_panel.setSpacing(10)
+        root.addLayout(left_panel, 0)
+
+        folder_buttons = QHBoxLayout()
+        left_panel.addLayout(folder_buttons)
+
+        self.add_folder_button = QPushButton("フォルダ追加")
+        self.add_folder_button.clicked.connect(self.add_folder)
+        self.add_folder_button.setAutoDefault(False)
+        self.add_folder_button.setDefault(False)
+        self.add_folder_button.setFocusPolicy(Qt.NoFocus)
+        folder_buttons.addWidget(self.add_folder_button)
+
+        self.remove_folder_button = QPushButton("選択削除")
+        self.remove_folder_button.clicked.connect(self.remove_selected_folder)
+        self.remove_folder_button.setAutoDefault(False)
+        self.remove_folder_button.setDefault(False)
+        self.remove_folder_button.setFocusPolicy(Qt.NoFocus)
+        folder_buttons.addWidget(self.remove_folder_button)
+
+        self.folder_list = QListWidget()
+        self.folder_list.setMinimumWidth(260)
+        self.folder_list.setFocusPolicy(Qt.ClickFocus)
+        self.folder_list.itemDoubleClicked.connect(self.jump_to_folder)
+        left_panel.addWidget(self.folder_list, 1)
+
+        self.folder_hint_label = QLabel("ダブルクリックでそのフォルダ先頭へ移動")
+        left_panel.addWidget(self.folder_hint_label)
+
+        right_panel = QVBoxLayout()
+        right_panel.setSpacing(10)
+        root.addLayout(right_panel, 1)
 
         controls = QHBoxLayout()
-        root.addLayout(controls)
-
-        self.open_button = QPushButton("フォルダを開く")
-        self.open_button.clicked.connect(self.choose_folder)
-        self.open_button.setAutoDefault(False)
-        self.open_button.setDefault(False)
-        self.open_button.setFocusPolicy(Qt.NoFocus)
-        controls.addWidget(self.open_button)
+        right_panel.addLayout(controls)
 
         controls.addWidget(QLabel("最低再生時間(秒)"))
 
@@ -127,11 +158,15 @@ class GifAlbumPlayer(QMainWindow):
         self.count_label = QLabel("GIF数: 0")
         controls.addWidget(self.count_label)
 
-        self.file_label = QLabel("再生中: なし")
-        self.file_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        root.addWidget(self.file_label)
+        self.folder_label = QLabel("現在フォルダ: なし")
+        self.folder_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        right_panel.addWidget(self.folder_label)
 
-        self.image_label = QLabel("GIFフォルダを選択してください")
+        self.file_label = QLabel("再生中GIF: なし")
+        self.file_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        right_panel.addWidget(self.file_label)
+
+        self.image_label = QLabel("GIFフォルダを追加してください")
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setStyleSheet(
             "background-color: black; color: white; border: 1px solid #444;"
@@ -139,24 +174,24 @@ class GifAlbumPlayer(QMainWindow):
         self.image_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.image_label.setMinimumSize(200, 200)
         self.image_label.setFocusPolicy(Qt.StrongFocus)
-        root.addWidget(self.image_label, 1)
+        right_panel.addWidget(self.image_label, 1)
 
         self.help_label = QLabel("Space: 一時停止  ←/→: 前後移動  F: 全画面")
-        root.addWidget(self.help_label)
+        right_panel.addWidget(self.help_label)
 
         self.status_label = QLabel("待機中")
-        root.addWidget(self.status_label)
+        right_panel.addWidget(self.status_label)
 
         self.setFocusPolicy(Qt.StrongFocus)
         self.centralWidget().setFocusPolicy(Qt.StrongFocus)
         self.image_label.setFocus()
 
     def _build_actions(self) -> None:
-        self.open_action = QAction("フォルダを開く", self)
-        self.open_action.triggered.connect(self.choose_folder)
-        self.open_action.setShortcut("Ctrl+O")
-        self.open_action.setShortcutContext(Qt.WindowShortcut)
-        self.addAction(self.open_action)
+        self.add_folder_action = QAction("フォルダ追加", self)
+        self.add_folder_action.triggered.connect(self.add_folder)
+        self.add_folder_action.setShortcut("Ctrl+O")
+        self.add_folder_action.setShortcutContext(Qt.WindowShortcut)
+        self.addAction(self.add_folder_action)
 
         self.pause_action = QAction("一時停止/再生", self)
         self.pause_action.triggered.connect(self.toggle_pause)
@@ -190,65 +225,220 @@ class GifAlbumPlayer(QMainWindow):
             saved_seconds = 3
         self.time_spin.setValue(saved_seconds)
 
-        saved_folder = self.settings.value("last_folder", "", type=str)
-        if saved_folder:
-            folder_path = Path(saved_folder)
+        saved_folders_raw = self.settings.value("folder_paths", "[]", type=str)
+        try:
+            saved_folders = json.loads(saved_folders_raw)
+        except Exception:
+            saved_folders = []
+
+        restored_any = False
+        for folder_str in saved_folders:
+            folder_path = Path(folder_str)
             if folder_path.exists() and folder_path.is_dir():
-                self.load_folder(folder_path)
-                self.status_label.setText(f"前回フォルダを復元: {folder_path}")
+                added = self._add_folder_path(folder_path, rebuild=False)
+                restored_any = restored_any or added
+
+        self._rebuild_playlist()
+        self._refresh_folder_list()
+
+        if restored_any and self.playlist:
+            self.play_index(0)
+            self.status_label.setText("前回フォルダ一覧を復元しました")
 
     def _save_settings(self) -> None:
         self.settings.setValue("min_seconds", self.time_spin.value())
+        folder_strings = [str(path) for path in self.folder_paths]
+        self.settings.setValue("folder_paths", json.dumps(folder_strings, ensure_ascii=False))
 
-        if self.gif_files and 0 <= self.current_index < len(self.gif_files):
-            current_folder = str(self.gif_files[self.current_index].parent)
-            self.settings.setValue("last_folder", current_folder)
+    # ---------------- フォルダ管理 ----------------
 
-    # ---------------- フォルダ ----------------
-
-    def choose_folder(self) -> None:
+    def add_folder(self) -> None:
         folder = QFileDialog.getExistingDirectory(self, "GIFフォルダを選択")
         if not folder:
             return
-        self.load_folder(Path(folder))
+
+        folder_path = Path(folder)
+        added = self._add_folder_path(folder_path, rebuild=True)
+        if added:
+            self.status_label.setText(f"フォルダ追加: {folder_path.name}")
         self.image_label.setFocus()
 
-    def load_folder(self, folder: Path) -> None:
-        gif_files = sorted(
-            [p for p in folder.iterdir() if p.is_file() and p.suffix.lower() == ".gif"]
-        )
+    def _add_folder_path(self, folder_path: Path, rebuild: bool = True) -> bool:
+        if folder_path in self.folder_paths:
+            self.status_label.setText(f"すでに登録済み: {folder_path.name}")
+            return False
 
-        self.stop_playback()
-        self._reset_preload_cache()
-        self.gif_files = gif_files
-        self.current_index = -1
-        self.count_label.setText(f"GIF数: {len(self.gif_files)}")
+        gif_files = self._get_gif_files_in_folder(folder_path)
+        if not gif_files:
+            self.status_label.setText(f"GIFが見つからないため追加しません: {folder_path.name}")
+            return False
 
-        if not self.gif_files:
-            self.file_label.setText("再生中: なし")
-            self.image_label.setText("このフォルダにはGIFがありません")
-            self.status_label.setText("GIFが見つかりません")
+        self.folder_paths.append(folder_path)
+
+        if rebuild:
+            self._rebuild_playlist()
+            self._refresh_folder_list()
+            if self.current_index == -1 and self.playlist:
+                self.play_index(0)
+            self._save_settings()
+        return True
+
+    def remove_selected_folder(self) -> None:
+        row = self.folder_list.currentRow()
+        if row < 0 or row >= len(self.folder_paths):
+            self.status_label.setText("削除するフォルダを選択してください")
             return
 
-        self.settings.setValue("last_folder", str(folder))
-        self.status_label.setText(f"読み込み完了: {folder}")
-        self.play_index(0)
+        folder_to_remove = self.folder_paths[row]
+        was_current_folder = False
+        current_gif_path: Path | None = None
+
+        if 0 <= self.current_index < len(self.playlist):
+            current_entry = self.playlist[self.current_index]
+            current_gif_path = current_entry["gif"]
+            was_current_folder = current_entry["folder"] == folder_to_remove
+
+        self.folder_paths.pop(row)
+        self._reset_preload_cache()
+        self._rebuild_playlist()
+        self._refresh_folder_list()
+        self._save_settings()
+
+        if not self.playlist:
+            self.stop_playback()
+            self.current_index = -1
+            self.folder_label.setText("現在フォルダ: なし")
+            self.file_label.setText("再生中GIF: なし")
+            self.count_label.setText("GIF数: 0")
+            self.image_label.setText("GIFフォルダを追加してください")
+            self.status_label.setText("登録フォルダがありません")
+            return
+
+        if was_current_folder:
+            target_index = row % len(self.playlist)
+            self.play_index(target_index)
+        else:
+            new_index = self._find_playlist_index_by_gif_path(current_gif_path)
+            if new_index is not None:
+                self.current_index = new_index
+                self._update_info_labels()
+                self._highlight_current_folder()
+            else:
+                self.play_index(0)
+
+        self.status_label.setText(f"フォルダ削除: {folder_to_remove.name}")
+        self.image_label.setFocus()
+
+    def jump_to_folder(self, item: QListWidgetItem) -> None:
+        row = self.folder_list.row(item)
+        if row < 0 or row >= len(self.folder_paths):
+            return
+
+        folder_path = self.folder_paths[row]
+        target_index = self._find_first_index_for_folder(folder_path)
+        if target_index is not None:
+            self.play_index(target_index)
+
+    def _get_gif_files_in_folder(self, folder_path: Path) -> list[Path]:
+        try:
+            return sorted(
+                [p for p in folder_path.iterdir() if p.is_file() and p.suffix.lower() == ".gif"]
+            )
+        except Exception:
+            return []
+
+    def _rebuild_playlist(self) -> None:
+        old_current_gif: Path | None = None
+        if 0 <= self.current_index < len(self.playlist):
+            old_current_gif = self.playlist[self.current_index]["gif"]
+
+        new_playlist: list[dict[str, Path]] = []
+        valid_folders: list[Path] = []
+
+        for folder_path in self.folder_paths:
+            gif_files = self._get_gif_files_in_folder(folder_path)
+            if not gif_files:
+                continue
+
+            valid_folders.append(folder_path)
+            for gif_path in gif_files:
+                new_playlist.append({"folder": folder_path, "gif": gif_path})
+
+        self.folder_paths = valid_folders
+        self.playlist = new_playlist
+        self.count_label.setText(f"GIF数: {len(self.playlist)}")
+
+        if not self.playlist:
+            self.current_index = -1
+            return
+
+        if old_current_gif is not None:
+            new_index = self._find_playlist_index_by_gif_path(old_current_gif)
+            self.current_index = new_index if new_index is not None else min(self.current_index, len(self.playlist) - 1)
+        elif self.current_index == -1:
+            self.current_index = 0
+        else:
+            self.current_index = min(self.current_index, len(self.playlist) - 1)
+
+    def _refresh_folder_list(self) -> None:
+        self.folder_list.blockSignals(True)
+        self.folder_list.clear()
+
+        for folder_path in self.folder_paths:
+            item = QListWidgetItem(folder_path.name)
+            item.setToolTip(str(folder_path))
+            self.folder_list.addItem(item)
+
+        self.folder_list.blockSignals(False)
+        self._highlight_current_folder()
+
+    def _highlight_current_folder(self) -> None:
+        if not self.playlist or not (0 <= self.current_index < len(self.playlist)):
+            self.folder_list.clearSelection()
+            return
+
+        current_folder = self.playlist[self.current_index]["folder"]
+        try:
+            row = self.folder_paths.index(current_folder)
+        except ValueError:
+            self.folder_list.clearSelection()
+            return
+
+        self.folder_list.setCurrentRow(row)
+
+    def _find_playlist_index_by_gif_path(self, gif_path: Path | None) -> int | None:
+        if gif_path is None:
+            return None
+        for i, entry in enumerate(self.playlist):
+            if entry["gif"] == gif_path:
+                return i
+        return None
+
+    def _find_first_index_for_folder(self, folder_path: Path) -> int | None:
+        for i, entry in enumerate(self.playlist):
+            if entry["folder"] == folder_path:
+                return i
+        return None
 
     # ---------------- 再生 ----------------
 
     def play_index(self, index: int) -> None:
-        if not self.gif_files:
+        if not self.playlist:
             return
 
-        actual_index = index % len(self.gif_files)
+        actual_index = index % len(self.playlist)
         self.stop_playback(clear_image=False)
         self.current_index = actual_index
-        gif_path = self.gif_files[self.current_index]
         self.is_paused = False
 
-        self.file_label.setText(f"再生中: {gif_path.name}")
+        entry = self.playlist[self.current_index]
+        folder_path = entry["folder"]
+        gif_path = entry["gif"]
+
+        self.folder_label.setText(f"現在フォルダ: {folder_path.name}")
+        self.file_label.setText(f"再生中GIF: {gif_path.name}")
         self.status_label.setText(
-            f"{self.current_index + 1} / {len(self.gif_files)} を再生中"
+            f"{self.current_index + 1} / {len(self.playlist)} を再生中"
         )
 
         loaded_from_preload = False
@@ -273,7 +463,7 @@ class GifAlbumPlayer(QMainWindow):
 
         if loaded_from_preload:
             self.status_label.setText(
-                f"{self.current_index + 1} / {len(self.gif_files)} を再生中（先読み済み）"
+                f"{self.current_index + 1} / {len(self.playlist)} を再生中（先読み済み）"
             )
 
         self.preloaded_index = None
@@ -281,19 +471,30 @@ class GifAlbumPlayer(QMainWindow):
         self.preloaded_durations = []
 
         self._start_preload_for_next()
+        self._highlight_current_folder()
         self._save_settings()
         self.image_label.setFocus()
 
-    def play_next(self) -> None:
-        if not self.gif_files:
+    def _update_info_labels(self) -> None:
+        if not self.playlist or not (0 <= self.current_index < len(self.playlist)):
+            self.folder_label.setText("現在フォルダ: なし")
+            self.file_label.setText("再生中GIF: なし")
             return
-        next_index = (self.current_index + 1) % len(self.gif_files)
+
+        entry = self.playlist[self.current_index]
+        self.folder_label.setText(f"現在フォルダ: {entry['folder'].name}")
+        self.file_label.setText(f"再生中GIF: {entry['gif'].name}")
+
+    def play_next(self) -> None:
+        if not self.playlist:
+            return
+        next_index = (self.current_index + 1) % len(self.playlist)
         self.play_index(next_index)
 
     def play_previous(self) -> None:
-        if not self.gif_files:
+        if not self.playlist:
             return
-        prev_index = (self.current_index - 1) % len(self.gif_files)
+        prev_index = (self.current_index - 1) % len(self.playlist)
         self.play_index(prev_index)
 
     def toggle_pause(self) -> None:
@@ -303,7 +504,7 @@ class GifAlbumPlayer(QMainWindow):
         if self.is_paused:
             self.is_paused = False
             self.status_label.setText(
-                f"{self.current_index + 1} / {len(self.gif_files)} を再生中"
+                f"{self.current_index + 1} / {len(self.playlist)} を再生中"
             )
             self._schedule_next_frame()
         else:
@@ -364,25 +565,26 @@ class GifAlbumPlayer(QMainWindow):
             return False, [], []
 
     def _start_preload_for_next(self) -> None:
-        if not self.gif_files:
+        if not self.playlist:
             return
 
-        next_index = (self.current_index + 1) % len(self.gif_files)
+        next_index = (self.current_index + 1) % len(self.playlist)
 
         if self.preloaded_index == next_index and self.preloaded_images:
             return
 
         self.preload_job_id += 1
         job_id = self.preload_job_id
+        gif_path = self.playlist[next_index]["gif"]
 
-        task = GifPreloadTask(job_id, next_index, self.gif_files[next_index])
+        task = GifPreloadTask(job_id, next_index, gif_path)
         task.signals.finished.connect(self._on_preload_finished)
         self.thread_pool.start(task)
 
     def _on_preload_finished(
         self,
         job_id: int,
-        index: int,
+        playlist_index: int,
         images: list[QImage],
         durations: list[int],
         error_message: str,
@@ -393,7 +595,7 @@ class GifAlbumPlayer(QMainWindow):
         if error_message or not images:
             return
 
-        self.preloaded_index = index
+        self.preloaded_index = playlist_index
         self.preloaded_images = images
         self.preloaded_durations = durations
 
